@@ -1,5 +1,5 @@
 import os
-
+import matplotlib.pyplot as plt
 # ==============================================================================
 # 【防卡死且提速的核心设置 1】：严格限制底层 C++ 库的线程数
 # 必须在 import torch 和 MinkowskiEngine 之前设置！
@@ -11,6 +11,7 @@ os.environ['OPENBLAS_NUM_THREADS'] = '1'
 
 import torch
 import torch.nn.functional as F
+import MinkowskiEngine as ME
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -18,23 +19,25 @@ from dataset import CelexBloodFlowDataset, sequence_sparse_collate
 from model import SNN_CNN_Hybrid
 
 
+
+
 def train_and_evaluate():
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     NUM_EPOCHS = 50
     BATCH_SIZE = 4
-    LEARNING_RATE = 1e-3
-    MASK_PATH = "/data/zm/2026.1.12_testdata/3.2NEW_RESULT/Hot_pixel/hot_pixel_mask.npy"
+    LEARNING_RATE = 2e-4
+    MASK_PATH = "/data/zm/Moshaboli/Mask/hot_pixel_mask.npy"
 
     # 你的数据路径字典 (请替换为你真实的路径和 d 值)
     train_config = {
-        "/data/zm/2026.1.12_testdata/gaoyuzhi": 0.014611,  # 比如某次标定的散斑为 50um
-        "/data/zm/2026.1.12_testdata/1.15_150_680W": 0.0105,  # 换了镜头后标定为 48um
-        "/data/zm/2026.1.12_testdata/2.3": 0.010099,
+        "/data/zm/Moshaboli/no1_140w": 0.00782,  # 比如某次标定的散斑为 50um
+        #"/data/zm/2026.1.12_testdata/1.15_150_680W": 0.0105,  # 换了镜头后标定为 48um
+        "/data/zm/Moshaboli/no4_180w": 0.00896,
     }
 
     val_config = {
-        "/data/zm/2026.1.12_testdata/1.15_150_580W": 0.0114853,
-        "/data/zm/2026.1.12_testdata/1.22data": 0.010154,
+        "/data/zm/Moshaboli/no5_130w": 0.00698,
+        "/data/zm/Moshaboli/no3_205w": 0.00978
     }
 
     print("正在加载训练集...")
@@ -76,6 +79,12 @@ def train_and_evaluate():
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
     best_val_loss = float('inf')
 
+    # ==============================================================================
+    # 【新增】：初始化列表，用于记录每一个 Epoch 的 Loss，方便最后画图
+    # ==============================================================================
+    history_train_loss = []
+    history_val_loss = []
+
     # ================= 4. 训练与验证主循环 =================
     for epoch in range(NUM_EPOCHS):
 
@@ -100,20 +109,26 @@ def train_and_evaluate():
             d_values = d_values.to(DEVICE)
 
             optimizer.zero_grad()
-            tau_c_pred = model(x_seq)
+            # 【关键修改】：把真实的 batch_size 传给前向传播函数
+            # 现在网络输出的不再是时间，而是频率 fc = 1 / tau_c
+            fc_pred = model(x_seq, actual_batch_size=len(y_true))
 
             d_values_expanded = d_values.view(-1, 1, 1, 1)
-            v_pred = d_values_expanded / (tau_c_pred + 1e-8)
+            # 乘法永远是绝对安全的，彻底告别梯度爆炸！
+            v_pred = d_values_expanded * fc_pred
             y_true_expanded = y_true.view(-1, 1, 1, 1).expand_as(v_pred)
 
             loss = F.mse_loss(v_pred, y_true_expanded)
             loss.backward()
+            # 加入梯度裁剪，强制将过大的梯度砍掉，保护网络权重不被摧毁
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
             train_loss_total += loss.item()
             pbar_train.set_postfix({'Loss': f"{loss.item():.4f}"})
 
         avg_train_loss = train_loss_total / len(train_loader)
+        history_train_loss.append(avg_train_loss)  # 记录当前 Epoch 的训练 Loss
 
         # ----------------- 验证阶段 -----------------
         model.eval()
@@ -133,10 +148,13 @@ def train_and_evaluate():
                 y_true = y_true.to(DEVICE)
                 d_values = d_values.to(DEVICE)
 
-                tau_c_pred = model(x_seq)
+                # 【关键修改】：把真实的 batch_size 传给前向传播函数
+                # 现在网络输出的不再是时间，而是频率 fc = 1 / tau_c
+                fc_pred = model(x_seq, actual_batch_size=len(y_true))
 
                 d_values_expanded = d_values.view(-1, 1, 1, 1)
-                v_pred = d_values_expanded / (tau_c_pred + 1e-8)
+                # 乘法永远是绝对安全的，彻底告别梯度爆炸！
+                v_pred = d_values_expanded * fc_pred
                 y_true_expanded = y_true.view(-1, 1, 1, 1).expand_as(v_pred)
 
                 loss = F.mse_loss(v_pred, y_true_expanded)
@@ -144,13 +162,36 @@ def train_and_evaluate():
                 pbar_val.set_postfix({'Val_Loss': f"{loss.item():.4f}"})
 
         avg_val_loss = val_loss_total / len(val_loader)
+        history_val_loss.append(avg_val_loss)  # 记录当前 Epoch 的验证 Loss
         print(f"--> Epoch {epoch + 1} 总结 | Train Avg Loss: {avg_train_loss:.4f} | Val Avg Loss: {avg_val_loss:.4f}")
 
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            torch.save(model.state_dict(), "best_hybrid_model.pth")
+            torch.save(model.state_dict(), "/data/zm/Moshaboli/Hybrid_Model/best_hybrid_model.pth")
             print(f"[*] 发现更低验证集误差，已保存最佳模型 (Val Loss: {best_val_loss:.4f})")
 
+    # ==============================================================================
+    # 【新增】：5. 训练结束，绘制并保存 Loss 曲线图
+    # ==============================================================================
+    print("训练结束，正在绘制并保存 Loss 曲线...")
+    plt.figure(figsize=(10, 6))
+
+    # 绘制训练和验证 Loss，打上标签
+    plt.plot(range(1, NUM_EPOCHS + 1), history_train_loss, label='Train Loss', marker='o', color='blue')
+    plt.plot(range(1, NUM_EPOCHS + 1), history_val_loss, label='Validation Loss', marker='s', color='orange')
+
+    # 设置图表标题、坐标轴标签和网格
+    plt.title('Training and Validation Loss Curve', fontsize=16)
+    plt.xlabel('Epochs', fontsize=12)
+    plt.ylabel('MSE Loss', fontsize=12)
+    plt.legend(fontsize=12)
+    plt.grid(True, linestyle='--', alpha=0.7)
+
+    # 将图片保存到当前目录下
+    plot_path = "/data/zm/Moshaboli/Loss_Plot/loss_curve.png"
+    plt.savefig(plot_path, bbox_inches='tight', dpi=300)
+    plt.close()  # 养成好习惯，画完图关闭画布释放内存
+    print(f"Loss 曲线已成功保存至当前目录: {plot_path}")
 
 if __name__ == '__main__':
     train_and_evaluate()
