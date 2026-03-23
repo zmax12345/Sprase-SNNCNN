@@ -12,28 +12,47 @@ class SNN_CNN_Hybrid(nn.Module):
         super(SNN_CNN_Hybrid, self).__init__()
         # SNN 输入: 100x768。经过两次 stride=2 的卷积
         # 第1层输出: 50x384
-        self.snn_enc1 = SparseSpikingConv2D(in_channels=1, out_channels=16, kernel=(5, 5), out_shape=(50, 384),
+        self.snn_enc1 = SparseSpikingConv2D(in_channels=1, out_channels=16, kernel=(5, 5), out_shape=(50, 184),
                                             stride=(2, 2))
         # 第2层输出: 25x192
-        self.snn_enc2 = SparseSpikingConv2D(in_channels=16, out_channels=32, kernel=(3, 3), out_shape=(25, 192),
+        self.snn_enc2 = SparseSpikingConv2D(in_channels=16, out_channels=32, kernel=(3, 3), out_shape=(25, 92),
                                             stride=(2, 2), return_dense=True)
 
         # CNN 解码器
+        #self.cnn_dec = nn.Sequential(
+         #  nn.Conv2d(32, 64, kernel_size=3, padding=1),
+          #  nn.ReLU(inplace=True),
+
+        #    # 替换掉那两个 ConvTranspose2d，用这个：
+        #    nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+         #   nn.Conv2d(64, 32, kernel_size=3, padding=1),
+         #   nn.ReLU(inplace=True),
+
+          #  nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+           # nn.Conv2d(32, 1, kernel_size=3, padding=1),
+
+            #nn.Softplus()
         self.cnn_dec = nn.Sequential(
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, 1, kernel_size=3, padding=1),  # 输出1通道: tau_c
-            nn.Upsample(size=(100, 768), mode='bilinear', align_corners=False),  # 恢复到ROI大小
-            nn.Softplus()  # 确保 tau_c 恒为正数，防止除零错误
+           nn.Conv2d(32, 64, kernel_size=3, padding=1),
+           nn.ReLU(inplace=True),
+
+           # 使用转置卷积放大 2 倍 (从 25x92 到 50x184)
+           nn.ConvTranspose2d(in_channels=64, out_channels=32, kernel_size=4, stride=2, padding=1),
+           nn.ReLU(inplace=True),
+
+           # 再使用一次转置卷积放大 2 倍 (从 50x184 恢复到 100x368)
+           nn.ConvTranspose2d(in_channels=32, out_channels=1, kernel_size=4, stride=2, padding=1),
+
+           nn.Softplus()
         )
 
-    def forward(self, x_seq):
-        batch_size = int(torch.max(x_seq[0].C[:, 0])) + 1
+    def forward(self, x_seq, actual_batch_size):
+
         mem1, mem2 = None, None
 
         for x_sparse in x_seq:
-            out1, mem1 = self.snn_enc1(x_sparse, mem=mem1, bs=batch_size)
-            out2, mem2 = self.snn_enc2(out1, mem=mem2, bs=batch_size)
+            out1, mem1 = self.snn_enc1(x_sparse, mem=mem1, bs=actual_batch_size)
+            out2, mem2 = self.snn_enc2(out1, mem=mem2, bs=actual_batch_size)
 
         # 输出每个像素点的去相关时间 tau_c, shape: [Batch, 1, 100, 768]
         tau_c = self.cnn_dec(mem2)
