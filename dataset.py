@@ -8,7 +8,7 @@ import MinkowskiEngine as ME
 
 
 class CelexBloodFlowDataset(Dataset):
-    def __init__(self, data_config, mask_path="hot_pixel_mask.npy", T=500, seq_len=20, dt_us=20):
+    def __init__(self, data_config, mask_path="hot_pixel_mask.npy", T=150, seq_len=70, dt_us=20):
         """
         data_config: 字典格式，例如：
         {
@@ -53,7 +53,7 @@ class CelexBloodFlowDataset(Dataset):
 
                 # 【防崩溃升级2】：调换顺序！先限制 ROI (Row: 400-499, Col: 0-767)
                 # 这样可以确保后续进入 hot_mask 的坐标绝对在安全范围内
-                df = df[(df['row'] >= 400) & (df['row'] <= 499) & (df['col'] >= 0) & (df['col'] <= 767)].copy()
+                df = df[(df['row'] >= 400) & (df['row'] <= 499) & (df['col'] >= 200) & (df['col'] <= 567)].copy()
 
                 if df.empty: continue
 
@@ -65,6 +65,8 @@ class CelexBloodFlowDataset(Dataset):
 
                 # 关键：将 Row 坐标平移到 0-99，匹配网络输入尺寸 100x768
                 df['row'] = df['row'] - 400
+
+                df['col'] = df['col'] - 200  # 确保送入网络的列坐标从 0 到 36
 
                 # 时间对齐与量化
                 t_start = df['t_in'].min()
@@ -89,13 +91,18 @@ class CelexBloodFlowDataset(Dataset):
                             coords, feats = torch.empty((0, 3), dtype=torch.int32), torch.empty((0, 1),
                                                                                                 dtype=torch.float32)
                         else:
-                            t_rescaled = frame_df['t_bin'].values - frame_start_bin
+                            # 【关键修复】：去掉 t_rescaled，只保留 row 和 col 构成 2D 空间坐标
+
                             locations = torch.IntTensor(
-                                np.column_stack((t_rescaled, frame_df['row'].values, frame_df['col'].values)))
+
+                                np.column_stack((frame_df['row'].values, frame_df['col'].values)))
+
                             features = torch.ones((len(frame_df), 1), dtype=torch.float32)
 
                             coords, feats = ME.utils.sparse_quantize(
-                                coordinates=locations, features=features, quantization_size=[1, 1, 1]
+
+                                coordinates=locations, features=features, quantization_size=[1, 1]
+
                             )
 
                         sequence_data.append((coords, feats))
@@ -112,14 +119,7 @@ class CelexBloodFlowDataset(Dataset):
         return self.samples[index]
 
 
-# =====================================================================
-# 将 collate_fn 放在 dataset.py 中，供 train.py 调用
-# =====================================================================
 def sequence_sparse_collate(batch):
-    """
-    将 Batch 中的稀疏张量列表在相同的时间步(帧)上进行合并打包。
-    返回: batched_seq (稀疏张量列表), labels (真值张量), d_values (散斑尺寸张量)
-    """
     seq_len = len(batch[0][0])
     batched_seq_data = []
 
@@ -128,12 +128,9 @@ def sequence_sparse_collate(batch):
         feats_t = [sample[0][t][1] for sample in batch]
 
         b_coords, b_feats = ME.utils.sparse_collate(coords_t, feats_t)
-        # 【关键修改】：不在这里实例化 ME.SparseTensor，而是直接保存元组
         batched_seq_data.append((b_coords, b_feats))
 
-    # 提取流速真值
     labels = torch.tensor([sample[1] for sample in batch], dtype=torch.float32)
-    # 提取对应的散斑物理尺寸 d
     d_values = torch.tensor([sample[2] for sample in batch], dtype=torch.float32)
 
-    return batched_seq, labels, d_values
+    return batched_seq_data, labels, d_values
