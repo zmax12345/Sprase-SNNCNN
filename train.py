@@ -19,25 +19,35 @@ from dataset import CelexBloodFlowDataset, sequence_sparse_collate
 from model import SNN_CNN_Hybrid
 
 
+def total_variation_loss(img):
+    """
+    计算图像的全变分损失 (TV Loss)，用于平滑相邻像素。
+    img shape: [Batch, Channel, Height, Width]
+    """
+    # 计算高度方向相邻像素的绝对差值均值
+    tv_h = torch.mean(torch.abs(img[:, :, 1:, :] - img[:, :, :-1, :]))
+    # 计算宽度方向相邻像素的绝对差值均值
+    tv_w = torch.mean(torch.abs(img[:, :, :, 1:] - img[:, :, :, :-1]))
 
+    return tv_h + tv_w
 
 def train_and_evaluate():
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     NUM_EPOCHS = 50
     BATCH_SIZE = 4
     LEARNING_RATE = 2e-4
-    MASK_PATH = "/data/zm/Moshaboli/Mask/hot_pixel_mask.npy"
+    MASK_PATH = "/data/zm/Moshaboli/new_data/other_data/hot_pixel_mask_strict.npy"
 
     # 你的数据路径字典 (请替换为你真实的路径和 d 值)
     train_config = {
-        "/data/zm/Moshaboli/no1_140w": 0.00782,  # 比如某次标定的散斑为 50um
+        "/data/zm/Moshaboli/new_data/no5": 0.01978,  # 比如某次标定的散斑为 50um
         #"/data/zm/2026.1.12_testdata/1.15_150_680W": 0.0105,  # 换了镜头后标定为 48um
-        "/data/zm/Moshaboli/no4_180w": 0.00896,
+        "/data/zm/Moshaboli/new_data/no1": 0.01891,
     }
 
     val_config = {
-        "/data/zm/Moshaboli/no5_130w": 0.00698,
-        "/data/zm/Moshaboli/no3_205w": 0.00978
+        "/data/zm/Moshaboli/new_data/no2": 0.01941,
+        "/data/zm/Moshaboli/new_data/no4": 0.01973
     }
 
     print("正在加载训练集...")
@@ -118,7 +128,22 @@ def train_and_evaluate():
             v_pred = d_values_expanded * fc_pred
             y_true_expanded = y_true.view(-1, 1, 1, 1).expand_as(v_pred)
 
-            loss = F.mse_loss(v_pred, y_true_expanded)
+            # ================== TV Loss 修改开始 ==================
+            # 1. 计算原本的主损失 (预测速度与真实速度的均方误差)
+            main_loss = F.mse_loss(v_pred, y_true_expanded)
+
+            # 2. 计算 TV Loss
+            # 注意：如果你的网络输出还是 768 宽，我们需要像 evaluate 里一样，
+            # 截取中心纯净区域 [200:568] 来计算平滑度，防止网络去过度平滑边缘的光学畸变。
+            # (如果你在 model.py 里已经把输出宽度改成了 368，请把 [:, :, :, 200:568] 删掉，直接传 v_pred)
+            v_pred_map = v_pred
+            loss_tv = total_variation_loss(v_pred_map)
+
+            # 3. 组合最终的总损失 (Total Loss)
+            lambda_tv = 0.005  # TV Loss 的权重，0.001 是一个非常经典的起步值
+            loss = main_loss + lambda_tv * loss_tv
+            # ================== TV Loss 修改结束 ==================
+
             loss.backward()
             # 加入梯度裁剪，强制将过大的梯度砍掉，保护网络权重不被摧毁
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -167,7 +192,7 @@ def train_and_evaluate():
 
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            torch.save(model.state_dict(), "/data/zm/Moshaboli/Hybrid_Model/best_hybrid_model.pth")
+            torch.save(model.state_dict(), "/data/zm/Moshaboli/new_data/Model/best_hybrid_model.pth")
             print(f"[*] 发现更低验证集误差，已保存最佳模型 (Val Loss: {best_val_loss:.4f})")
 
     # ==============================================================================
@@ -188,7 +213,7 @@ def train_and_evaluate():
     plt.grid(True, linestyle='--', alpha=0.7)
 
     # 将图片保存到当前目录下
-    plot_path = "/data/zm/Moshaboli/Loss_Plot/loss_curve.png"
+    plot_path = "/data/zm/Moshaboli/new_data/Loss_curve/loss_curve.png"
     plt.savefig(plot_path, bbox_inches='tight', dpi=300)
     plt.close()  # 养成好习惯，画完图关闭画布释放内存
     print(f"Loss 曲线已成功保存至当前目录: {plot_path}")
